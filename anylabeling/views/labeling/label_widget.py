@@ -9,6 +9,8 @@ import re
 import shutil
 import time
 import webbrowser
+import yaml
+import chardet
 
 import cv2
 from difflib import SequenceMatcher
@@ -4802,6 +4804,82 @@ class LabelingWidget(LabelDialog):
 
         self.export_annotations(converter, mode, ratio, train_dir, val_dir, label_dir_path, skip_empty_files,
                                 save_images)
+
+        # 在导出完成后生成 YAML 文件
+        self.generate_yaml_file(save_path, train_dir, val_dir)
+
+    def generate_yaml_file(self, save_path, train_dir, val_dir):
+        yaml_path = osp.join(save_path, 'dataset.yaml')
+
+        try:
+            nc = self.get_number_of_classes()
+        except Exception as e:
+            self.handle_export_error(e, None)
+            return
+
+        try:
+            names = self.get_class_names()
+            # 确保 names 列表中的所有元素都是 Unicode 字符串
+            unicode_names = [str(name) for name in names]
+        except (FileNotFoundError, ValueError, RuntimeError) as e:
+            self.handle_export_error(e, None)
+            return
+
+        yaml_content = {
+            'train': train_dir,
+            'val': val_dir,
+            'nc': nc,
+            'names': unicode_names  # 使用 Unicode 字符串列表
+        }
+
+        try:
+            with open(yaml_path, 'w', encoding='utf-8') as yaml_file:
+                yaml.dump(yaml_content, yaml_file, default_flow_style=False, allow_unicode=True)
+            self.show_success_message(f"YAML file generated successfully at: {yaml_path}")
+        except Exception as e:
+            self.handle_export_error(e, None)
+
+    def get_number_of_classes(self):
+        # 假设 classes_file 中包含了类别信息
+        if not self.classes_file:
+            return 0
+
+        try:
+            with open(self.classes_file, 'rb') as f:  # 以二进制模式读取文件
+                raw_data = f.read()
+                result = chardet.detect(raw_data)
+                encoding = result['encoding']
+
+            if encoding:
+                with open(self.classes_file, 'r', encoding=encoding) as f:
+                    classes = f.readlines()
+                return len(classes)
+            else:
+                raise ValueError(f"无法检测到文件 {self.classes_file} 的编码格式，请手动指定。")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"文件 {self.classes_file} 未找到。")
+        except Exception as e:
+            raise RuntimeError(f"读取文件 {self.classes_file} 时发生错误: {e}")
+
+    def get_class_names(self):
+        # 获取类别名称列表
+        if not self.classes_file:
+            return []
+
+        try:
+            encoding = 'utf-8'  # 强制指定编码为 UTF-8
+            print(f"Using encoding: {encoding}")
+
+            with open(self.classes_file, 'r', encoding=encoding) as f:
+                classes = [line.strip() for line in f.readlines()]
+            print(f"classes: {classes}")
+            return classes
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"文件 {self.classes_file} 未找到。")
+        except Exception as e:
+            raise RuntimeError(f"读取文件 {self.classes_file} 时发生错误: {e}")
 
     def get_export_options(self):
         # 创建一个对话框，让用户选择是否跳过空文件和保存图像
