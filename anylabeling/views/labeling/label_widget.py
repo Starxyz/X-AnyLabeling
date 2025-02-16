@@ -4657,63 +4657,183 @@ class LabelingWidget(LabelDialog):
             error_dialog.setInformativeText(str(e))
             error_dialog.setWindowTitle(self.tr("Error"))
             error_dialog.exec_()
+    # new function for export yolo annotation
+    def handle_export_error(self, error, progress_dialog):
+        logger.error(f"Error occurred while exporting annotations: {error}")
+        progress_dialog.close()
+        error_dialog = QMessageBox()
+        error_dialog.setIcon(QMessageBox.Critical)
+        error_dialog.setText(self.tr("Error occurred while exporting annotations."))
+        error_dialog.setInformativeText(str(error))
+        error_dialog.setWindowTitle(self.tr("Error"))
+        error_dialog.exec_()
+
+    def show_success_message(self, save_path):
+        msg_box = QMessageBox()
+        msg_box.setIcon(QMessageBox.Information)
+        msg_box.setText(self.tr("Exporting annotations successfully!"))
+        msg_box.setInformativeText(self.tr(f"Results have been saved to:\n{save_path}"))
+        msg_box.setWindowTitle(self.tr("Success"))
+        msg_box.exec_()
+
+    def show_warning(self, message):
+        QtWidgets.QMessageBox.warning(self, self.tr("Warning"), self.tr(message), QtWidgets.QMessageBox.Ok)
+
+    def setup_progress_dialog(self, total_items):
+        progress_dialog = QProgressDialog(
+            self.tr("Exporting..."),
+            self.tr("Cancel"),
+            0,
+            total_items,
+        )
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setWindowTitle(self.tr("Progress"))
+        progress_dialog.setStyleSheet(
+            """
+            QProgressDialog QProgressBar {
+                border: 1px solid grey;
+                border-radius: 5px;
+                text-align: center;
+            }
+            QProgressDialog QProgressBar::chunk {
+                background-color: orange;
+            }
+            """
+        )
+        return progress_dialog
+
+
+
+    def setup_converter(self, mode):
+        if mode == "pose":
+            self.yaml_file = self.get_file("Select a specific yolo-pose config file", "yaml")
+            if not self.yaml_file:
+                self.show_warning("Please select a specific config file!")
+                return None
+            return LabelConverter(pose_cfg_file=self.yaml_file)
+        elif mode in ["hbb", "obb", "seg"]:
+            self.classes_file = self.get_file("Select a specific classes file", "txt")
+            if not self.classes_file:
+                self.show_warning("Please select a specific classes file!")
+                return None
+            return LabelConverter(classes_file=self.classes_file)
+
+    def get_file(self, dialog_title, file_type):
+        filter = f"Classes Files (*.{file_type});;All Files (*)"
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, self.tr(dialog_title), "", filter)
+        return file_path
+
+    def get_train_val_ratio(self):
+        ratio, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            self.tr("Train/Val Split"),
+            self.tr("Enter train/val split ratio (e.g., 0.8 for 80% train, 20% val):"),
+            0.8, 0, 1, 2
+        )
+        return ratio if ok else None
+
+    def create_train_val_dirs(self, save_path):
+        train_dir = osp.join(save_path, "train")
+        val_dir = osp.join(save_path, "val")
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(val_dir, exist_ok=True)
+        return train_dir, val_dir
+
+    def export_annotations(self, converter, mode, ratio, train_dir, val_dir, label_dir_path, skip_empty_files,
+                           save_images):
+        image_list = self.image_list if self.image_list else [self.filename]
+        progress_dialog = self.setup_progress_dialog(len(image_list))
+
+        try:
+            for i, image_file in enumerate(image_list):
+                self.export_single_annotation(converter, mode, ratio, train_dir, val_dir, image_file, label_dir_path,
+                                              skip_empty_files, save_images)
+                progress_dialog.setValue(i)
+                if progress_dialog.wasCanceled():
+                    break
+            progress_dialog.close()
+            self.show_success_message(label_dir_path)
+        except Exception as e:
+            self.handle_export_error(e, progress_dialog)
+
+    def export_single_annotation(self, converter, mode, ratio, train_dir, val_dir, image_file, label_dir_path,
+                                 skip_empty_files, save_images):
+        image_file_name = osp.basename(image_file)
+        label_file_name = osp.splitext(image_file_name)[0] + ".json"
+        dst_file_name = osp.splitext(image_file_name)[0] + ".txt"
+        dst_dir = train_dir if np.random.rand() < ratio else val_dir
+        dst_file = osp.join(dst_dir, dst_file_name)
+        src_file = osp.join(label_dir_path, label_file_name)
+
+        is_empty_file = converter.custom_to_yolo(src_file, dst_file, mode, skip_empty_files)
+        if save_images and not (skip_empty_files and is_empty_file):
+            image_dst = osp.join(dst_dir, image_file_name)
+            shutil.copy(image_file, image_dst)
+        if skip_empty_files and is_empty_file and osp.exists(dst_file):
+            os.remove(dst_file)
 
     # Export
     def export_yolo_annotation(self, mode, _value=False, dirpath=None):
-        if not self.may_continue():
+        if not self.may_continue() or not self.filename:
+            self.show_warning("Please load an image folder before proceeding!")
             return
 
-        if not self.filename:
-            QtWidgets.QMessageBox.warning(
-                self,
-                self.tr("Warning"),
-                self.tr("Please load an image folder before proceeding!"),
-                QtWidgets.QMessageBox.Ok,
-            )
+        converter = self.setup_converter(mode)
+        if not converter:
             return
 
-        # Handle config/classes file selection based on mode
-        if mode == "pose":
-            filter = "Classes Files (*.yaml);;All Files (*)"
-            self.yaml_file, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self,
-                self.tr("Select a specific yolo-pose config file"),
-                "",
-                filter,
-            )
-            if not self.yaml_file:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    self.tr("Warning"),
-                    self.tr("Please select a specific config file!"),
-                    QtWidgets.QMessageBox.Ok,
-                )
-                return
-            converter = LabelConverter(pose_cfg_file=self.yaml_file)
-        elif mode in ["hbb", "obb", "seg"]:
-            filter = "Classes Files (*.txt);;All Files (*)"
-            self.classes_file, _ = QtWidgets.QFileDialog.getOpenFileName(
-                self,
-                self.tr("Select a specific classes file"),
-                "",
-                filter,
-            )
-            if not self.classes_file:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    self.tr("Warning"),
-                    self.tr("Please select a specific classes file!"),
-                    QtWidgets.QMessageBox.Ok,
-                )
-                return
-            converter = LabelConverter(classes_file=self.classes_file)
+        ratio = self.get_train_val_ratio()
+        if ratio is None:
+            return
 
-        # Create options dialog with additional export path selection
-        dialog = QtWidgets.QDialog()
+        save_path = self.get_save_path()
+        if not save_path:
+            return
+
+        train_dir, val_dir = self.create_train_val_dirs(save_path)
+
+        # 定义 label_dir_path
+        label_dir_path = osp.dirname(self.filename)
+        if self.output_dir:
+            label_dir_path = self.output_dir
+
+        # 定义 skip_empty_files 和 save_images
+        skip_empty_files, save_images = self.get_export_options()
+
+        self.export_annotations(converter, mode, ratio, train_dir, val_dir, label_dir_path, skip_empty_files,
+                                save_images)
+
+    def get_export_options(self):
+        # 创建一个对话框，让用户选择是否跳过空文件和保存图像
+        dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(self.tr("Export Options"))
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(dialog)
 
-        # Add export path selection
+        skip_empty_files_checkbox = QtWidgets.QCheckBox(self.tr("Skip empty labels?"))
+        skip_empty_files_checkbox.setChecked(False)
+        layout.addWidget(skip_empty_files_checkbox)
+
+        save_images_checkbox = QtWidgets.QCheckBox(self.tr("Save images?"))
+        save_images_checkbox.setChecked(False)
+        layout.addWidget(save_images_checkbox)
+
+        button_box = QtWidgets.QPushButton(self.tr("OK"))
+        button_box.clicked.connect(dialog.accept)
+        layout.addWidget(button_box)
+
+        dialog.setLayout(layout)
+        result = dialog.exec_()
+
+        skip_empty_files = skip_empty_files_checkbox.isChecked()
+        save_images = save_images_checkbox.isChecked()
+
+        return skip_empty_files, save_images
+
+    def get_save_path(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(self.tr("Export Options"))
+        layout = QVBoxLayout(dialog)
+
         path_layout = QHBoxLayout()
         path_label = QtWidgets.QLabel(self.tr("Export Path:"))
         path_edit = QtWidgets.QLineEdit()
@@ -4723,9 +4843,7 @@ class LabelingWidget(LabelDialog):
         label_dir_path = osp.dirname(self.filename)
         if self.output_dir:
             label_dir_path = self.output_dir
-        default_save_path = osp.realpath(
-            osp.join(label_dir_path, "..", "labels")
-        )
+        default_save_path = osp.realpath(osp.join(label_dir_path, "..", "labels"))
         path_edit.setText(default_save_path)
 
         def browse_export_path():
@@ -4743,17 +4861,6 @@ class LabelingWidget(LabelDialog):
         path_layout.addWidget(path_button)
         layout.addLayout(path_layout)
 
-        # Add other options
-        save_images_checkbox = QtWidgets.QCheckBox(self.tr("Save images?"))
-        save_images_checkbox.setChecked(False)
-        layout.addWidget(save_images_checkbox)
-
-        skip_empty_files_checkbox = QtWidgets.QCheckBox(
-            self.tr("Skip empty labels?")
-        )
-        skip_empty_files_checkbox.setChecked(False)
-        layout.addWidget(skip_empty_files_checkbox)
-
         button_box = QtWidgets.QPushButton(self.tr("OK"))
         button_box.clicked.connect(dialog.accept)
         layout.addWidget(button_box)
@@ -4761,107 +4868,7 @@ class LabelingWidget(LabelDialog):
         dialog.setLayout(layout)
         result = dialog.exec_()
 
-        if not result:
-            return
-
-        save_images = save_images_checkbox.isChecked()
-        skip_empty_files = skip_empty_files_checkbox.isChecked()
-        save_path = path_edit.text()
-
-        # Check if export directory exists and handle overwrite
-        if osp.exists(save_path):
-            response = QtWidgets.QMessageBox.warning(
-                self,
-                self.tr("Output Directory Exists!"),
-                self.tr(
-                    "Directory already exists. Choose an action:\n"
-                    "Yes - Merge with existing files\n"
-                    "No - Delete existing directory\n"
-                    "Cancel - Abort export"
-                ),
-                QtWidgets.QMessageBox.Yes
-                | QtWidgets.QMessageBox.No
-                | QtWidgets.QMessageBox.Cancel,
-            )
-
-            if response == QtWidgets.QMessageBox.Cancel:
-                return
-            elif response == QtWidgets.QMessageBox.No:
-                shutil.rmtree(save_path)
-                os.makedirs(save_path)
-        else:
-            os.makedirs(save_path)
-
-        # Setup progress dialog
-        image_list = self.image_list if self.image_list else [self.filename]
-        progress_dialog = QProgressDialog(
-            self.tr("Exporting..."),
-            self.tr("Cancel"),
-            0,
-            len(image_list),
-        )
-        progress_dialog.setWindowModality(Qt.WindowModal)
-        progress_dialog.setWindowTitle(self.tr("Progress"))
-        progress_dialog.setStyleSheet(
-            """
-            QProgressDialog QProgressBar {
-                border: 1px solid grey;
-                border-radius: 5px;
-                text-align: center;
-            }
-            QProgressDialog QProgressBar::chunk {
-                background-color: orange;
-            }
-            """
-        )
-
-        try:
-            # Process files
-            for i, image_file in enumerate(image_list):
-                image_file_name = osp.basename(image_file)
-                label_file_name = osp.splitext(image_file_name)[0] + ".json"
-                dst_file_name = osp.splitext(image_file_name)[0] + ".txt"
-                dst_file = osp.join(save_path, dst_file_name)
-                src_file = osp.join(label_dir_path, label_file_name)
-
-                is_empty_file = converter.custom_to_yolo(
-                    src_file, dst_file, mode, skip_empty_files
-                )
-
-                if save_images and not (skip_empty_files and is_empty_file):
-                    image_dst = osp.join(save_path, image_file_name)
-                    shutil.copy(image_file, image_dst)
-
-                if skip_empty_files and is_empty_file and osp.exists(dst_file):
-                    os.remove(dst_file)
-
-                progress_dialog.setValue(i)
-                if progress_dialog.wasCanceled():
-                    break
-
-            progress_dialog.close()
-
-            # Show success message
-            msg_box = QMessageBox()
-            msg_box.setIcon(QMessageBox.Information)
-            msg_box.setText(self.tr("Exporting annotations successfully!"))
-            msg_box.setInformativeText(
-                self.tr(f"Results have been saved to:\n{save_path}")
-            )
-            msg_box.setWindowTitle(self.tr("Success"))
-            msg_box.exec_()
-
-        except Exception as e:
-            logger.error(f"Error occurred while exporting annotations: {e}")
-            progress_dialog.close()
-            error_dialog = QMessageBox()
-            error_dialog.setIcon(QMessageBox.Critical)
-            error_dialog.setText(
-                self.tr("Error occurred while exporting annotations.")
-            )
-            error_dialog.setInformativeText(str(e))
-            error_dialog.setWindowTitle(self.tr("Error"))
-            error_dialog.exec_()
+        return path_edit.text() if result else None
 
     def export_voc_annotation(self, mode, _value=False, dirpath=None):
         if not self.may_continue():
